@@ -10,13 +10,21 @@ from typing import Dict, Iterable, List
 import pandas as pd
 
 DEFAULT_VALUE = "未捕获相关数据"
+DEFAULT_INPUT_PATH = Path(r"C:\Users\yangk\SC-CD-BSL-CE-21.CDMA-2025.10.24.txt")
 
 
 def _first_match(pattern: str, text: str, flags: int = 0, default: str = DEFAULT_VALUE) -> str:
     match = re.search(pattern, text, flags)
-    if match:
-        return match.group(0).strip()
-    return default
+    if not match:
+        return default
+
+    if match.lastindex:
+        for index in range(1, match.lastindex + 1):
+            group_value = match.group(index)
+            if group_value:
+                return group_value.strip()
+
+    return match.group(0).strip()
 
 
 def parse_display_current_configuration(text: str) -> pd.DataFrame:
@@ -39,14 +47,15 @@ def parse_display_current_configuration(text: str) -> pd.DataFrame:
 
     rows: List[Dict[str, str]] = []
     for chunk in interface_chunks:
-        interface_name = _first_match(r"(?<=^interface )\S+", chunk, re.MULTILINE)
-        ipv4_address = _first_match(r"(?<=^ ip address )[\S ]+", chunk, re.MULTILINE)
+        interface_name = _first_match(r"^interface (\S+)", chunk, re.MULTILINE)
+        ipv4_address = _first_match(r"^\s*ip address ([\S ]+)", chunk, re.MULTILINE)
         vlan_id = _first_match(
-            r"(?<= port default )[\S ]+|(?<= vlan-type dot1q )[\S ]+|(?<= port trunk allow-pass )[\S ]+",
+            r"^\s*port default ([\S ]+)|^\s*vlan-type dot1q ([\S ]+)|^\s*port trunk allow-pass ([\S ]+)",
             chunk,
+            re.MULTILINE,
         )
-        vpn = _first_match(r"(?<= ip binding vpn-instance )[\S ]+", chunk)
-        description = _first_match(r"(?<= description )[\S ]+", chunk)
+        vpn = _first_match(r"^\s*ip binding vpn-instance ([\S ]+)", chunk, re.MULTILINE)
+        description = _first_match(r"^\s*description ([\S ]+)", chunk, re.MULTILINE)
 
         rows.append(
             {
@@ -86,22 +95,29 @@ def parse_display_interface(text: str) -> pd.DataFrame:
 
     rows: List[Dict[str, str]] = []
     for chunk in interface_chunks:
-        interface_name = _first_match(r"^\S+", chunk)
+        interface_name = _first_match(r"^(\S+)", chunk)
         current_state = _first_match(
-            r"(?<=^\S{1,40} current state : )\S+", chunk
+            r"^\S{1,40} current state : ([\S ]+)",
+            chunk,
+            re.MULTILINE,
         )
         link_state = _first_match(
-            r"(?<=Line protocol current state : )\S+", chunk
+            r"Line protocol current state : ([\S ]+)",
+            chunk,
         )
         speed = _first_match(
-            r"(?<=Port BW: )\S+?(?=,)|(?<=Current BW: ?)\S+?(?=,)", chunk
+            r"Port BW: (\S+?)(?=,)|Current BW: ?(\S+?)(?=,)",
+            chunk,
         )
-        module_type = _first_match(r"(?<=Transceiver Mode: |Media type: )\S+", chunk)
-        rx_power = _first_match(r"(?<=Rx Power: )\S+", chunk)
-        tx_power = _first_match(r"(?<=Tx Power: )\S+", chunk)
-        wavelength = _first_match(r"(?<=WaveLength: )\S+(?=,)", chunk)
-        distance = _first_match(r"(?<=Transmission Distance: )\S+", chunk)
-        crc = _first_match(r"(?<=CRC: )\S+", chunk)
+        module_type = _first_match(
+            r"Transceiver Mode: (\S+)|Media type: (\S+)",
+            chunk,
+        )
+        rx_power = _first_match(r"Rx Power: (\S+)", chunk)
+        tx_power = _first_match(r"Tx Power: (\S+)", chunk)
+        wavelength = _first_match(r"WaveLength: (\S+)(?=,)", chunk)
+        distance = _first_match(r"Transmission Distance: (\S+)", chunk)
+        crc = _first_match(r"CRC: (\S+)", chunk)
 
         rows.append(
             {
@@ -151,27 +167,72 @@ def parse_arguments(argv: Iterable[str] | None = None) -> argparse.Namespace:
         description="从display命令采集的文本中提取接口信息，并输出Excel。"
     )
     parser.add_argument(
-        "input",
+        "-i",
+        "--input",
         type=Path,
+        default=DEFAULT_INPUT_PATH,
         help="display命令的原始txt文件",
     )
     parser.add_argument(
-        "output",
+        "-o",
+        "--output",
         type=Path,
         help="输出Excel文件路径，例如 result.xlsx",
     )
-    return parser.parse_args(argv)
+
+    # 使用 parse_known_args 以兼容 Jupyter/ IPython 额外注入的参数（例如 -f）。
+    args, _ = parser.parse_known_args(argv)
+    return args
 
 
-def main(argv: Iterable[str] | None = None) -> None:
-    args = parse_arguments(argv)
-    text = read_text(args.input)
+def _prompt_for_path(prompt: str) -> Path:
+    """Prompt the user for a path when CLI arguments are missing."""
+
+    try:
+        raw_value = input(prompt)
+    except EOFError:  # pragma: no cover - defensive: non-interactive environments
+        raise SystemExit("未提供必要的文件路径，程序终止。") from None
+
+    raw_value = raw_value.strip()
+    if not raw_value:
+        raise SystemExit("未提供必要的文件路径，程序终止。")
+
+    return Path(raw_value)
+
+
+def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path]:
+    """Resolve input/output paths from CLI args or interactive prompts."""
+
+    input_path = args.input
+    output_path = args.output
+
+    # 如果缺少参数，在交互式环境下提示用户输入。
+    if input_path is None:
+        input_path = _prompt_for_path("请输入display命令txt文件路径：")
+    if output_path is None:
+        output_path = _prompt_for_path("请输入输出Excel文件路径，例如 result.xlsx：")
+
+    return input_path, output_path
+
+
+def process_file(input_path: Path, output_path: Path) -> None:
+    text = read_text(input_path)
 
     dataset1 = parse_display_current_configuration(text)
     dataset2 = parse_display_interface(text)
     merged = merge_datasets(dataset1, dataset2)
 
-    write_excel(merged, args.output)
+    write_excel(merged, output_path)
+
+
+def main(argv: Iterable[str] | None = None) -> None:
+    args = parse_arguments(argv)
+    input_path, output_path = _resolve_paths(args)
+
+    if not input_path.exists():
+        raise SystemExit(f"找不到输入文件：{input_path}")
+
+    process_file(input_path, output_path)
 
 
 if __name__ == "__main__":
